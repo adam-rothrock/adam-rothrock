@@ -1,0 +1,675 @@
+# ============================================================
+# ROTHBOT — VERIFIED QUERIES
+# Direct SQL lookup — bypasses Cortex Analyst wrapper entirely.
+# Matched against user prompt using fuzzy keyword scoring.
+# Add new entries here; Claude maintains this file.
+# Last updated: 2026-02-25
+# ============================================================
+
+queries:
+
+  # ── COMMIT / BURNDOWN RISK ──────────────────────────────────────────────────
+
+  - name: commit_customers_90_day_burndown
+    question: "Which commit customers will exhaust their credit balance in the next 90 days?"
+    aliases:
+      - customers likely to run out of their commit soon
+      - customers running out of commit in 90 days
+      - what customers are likely to run out of their commit
+      - commit customers almost out of credits
+      - which customers will run out of commit next 90 days
+      - customers expiring commit 90 days
+      - commit burn down risk
+    sql: |
+      SELECT
+           metronome_customer_name
+          ,expected_credit_total_consumed_date
+          ,commit_amount_remaining
+          ,pct_commit_amount_remaining
+          ,finance_segment
+          ,DATEDIFF('day', CURRENT_DATE, expected_credit_total_consumed_date) AS days_until_exhausted
+      FROM analytics.prod_internal_bi.finance_consumption_revenue_explorer
+      WHERE as_of_date = most_recent_revenue_date
+        AND expected_credit_total_consumed_date IS NOT NULL
+        AND expected_credit_total_consumed_date BETWEEN CURRENT_DATE AND DATEADD('day', 90, CURRENT_DATE)
+      ORDER BY expected_credit_total_consumed_date ASC
+
+  - name: commit_customers_low_balance
+    question: "Which customers are almost out of their commit balance?"
+    aliases:
+      - customers almost out of commit
+      - show me customers running low on commit
+      - commit customers less than 20 percent remaining
+      - customers with less than 20% commit remaining
+      - almost out of commit
+      - commit balance low
+      - customers running out of credits
+      - pct commit remaining less than 20
+    sql: |
+      SELECT
+           metronome_customer_name
+          ,pct_commit_amount_remaining
+          ,commit_amount_remaining
+          ,expected_credit_total_consumed_date
+          ,finance_segment
+          ,as_of_date
+      FROM analytics.prod_internal_bi.finance_consumption_revenue_explorer
+      WHERE as_of_date = most_recent_revenue_date
+        AND pct_commit_amount_remaining < 0.20
+      ORDER BY pct_commit_amount_remaining ASC
+
+  - name: commit_customers_under_consuming_breakage
+    question: "Which customers are under-consuming their commit and at risk of breakage?"
+    aliases:
+      - customers under consuming commit
+      - breakage risk customers
+      - customers at risk of breakage
+      - under consuming breakage
+      - customers not burning down fast enough
+      - pacing below straightline
+      - customers consuming below their commit
+      - which customers are below commit
+      - who is under consuming
+      - under consuming customers list
+      - list customers below their commit
+      - give me customers under consuming
+      - customers below commit
+    sql: |
+      WITH base AS (
+        SELECT
+             DATE_TRUNC('month', commit_expiry_date)  AS expiry_month
+            ,metronome_customer_name
+            ,finance_segment
+            ,commit_expiry_date
+            ,days_remaining_in_commit
+            ,commit_amount_remaining                  AS current_commit_balance
+            ,dollar_expected_commit_remaining         AS projected_unused_commit_at_expiry
+            ,ROW_NUMBER() OVER (
+                PARTITION BY DATE_TRUNC('month', commit_expiry_date)
+                ORDER BY dollar_expected_commit_remaining DESC NULLS LAST
+            ) AS month_rank
+        FROM analytics.prod_internal_bi.finance_consumption_revenue_explorer
+        WHERE as_of_date = most_recent_revenue_date
+          AND consumption_type ILIKE '%commit%'
+          AND commit_consumption_pacing_group ILIKE '%under%'
+      ),
+      monthly_totals AS (
+        SELECT
+             expiry_month
+            ,'-- MONTH TOTAL --'               AS metronome_customer_name
+            ,NULL                              AS finance_segment
+            ,NULL                              AS commit_expiry_date
+            ,NULL                              AS days_remaining_in_commit
+            ,SUM(current_commit_balance)       AS current_commit_balance
+            ,SUM(projected_unused_commit_at_expiry) AS projected_unused_commit_at_expiry
+            ,0                                 AS month_rank
+        FROM base
+        GROUP BY 1
+      ),
+      combined AS (
+        SELECT * FROM monthly_totals
+        UNION ALL
+        SELECT * FROM base
+      )
+      SELECT
+           expiry_month
+          ,metronome_customer_name
+          ,finance_segment
+          ,commit_expiry_date
+          ,days_remaining_in_commit
+          ,current_commit_balance
+          ,projected_unused_commit_at_expiry
+          ,month_rank
+      FROM combined
+      ORDER BY expiry_month ASC, month_rank ASC
+
+  - name: under_consuming_breakage_summary
+    question: "How many customers are under-consuming and how much commit revenue is forecasted to expire unused?"
+    aliases:
+      - breakage revenue forecast
+      - total projected breakage
+      - how much commit will expire unused
+      - forecast breakage revenue
+      - total under consuming breakage
+      - commit revenue expiring unused
+      - how much breakage revenue do we have
+      - breakage summary
+      - under consuming summary
+      - customers below commit summary
+    sql: |
+      WITH under_consuming AS (
+        SELECT
+             metronome_customer_name
+            ,finance_segment
+            ,commit_expiry_date
+            ,days_remaining_in_commit
+            ,commit_amount_remaining
+            ,dollar_expected_commit_remaining
+            ,snapshot_date_customer_revenue_final     AS current_daily_revenue
+        FROM analytics.prod_internal_bi.finance_consumption_revenue_explorer
+        WHERE as_of_date = most_recent_revenue_date
+          AND consumption_type ILIKE '%commit%'
+          AND commit_consumption_pacing_group ILIKE '%under%'
+      )
+      SELECT
+           COUNT(DISTINCT metronome_customer_name)        AS under_consuming_customer_count
+          ,SUM(dollar_expected_commit_remaining)          AS total_projected_breakage_revenue
+          ,SUM(commit_amount_remaining)                   AS total_commit_balance_at_risk
+          ,AVG(days_remaining_in_commit)                  AS avg_days_remaining_in_commit
+      FROM under_consuming
+
+  - name: under_consuming_customers_by_segment
+    question: "Break down under-consuming customers and projected breakage by segment."
+    aliases:
+      - breakage by segment
+      - under consuming by segment
+      - breakage risk by segment
+      - which segments have the most breakage risk
+    sql: |
+      SELECT
+           finance_segment
+          ,COUNT(DISTINCT metronome_customer_name)        AS customer_count
+          ,SUM(dollar_expected_commit_remaining)          AS total_projected_breakage
+          ,SUM(commit_amount_remaining)                   AS total_commit_balance
+          ,AVG(days_remaining_in_commit)                  AS avg_days_to_expiry
+      FROM analytics.prod_internal_bi.finance_consumption_revenue_explorer
+      WHERE as_of_date = most_recent_revenue_date
+        AND consumption_type ILIKE '%commit%'
+        AND commit_consumption_pacing_group ILIKE '%under%'
+      GROUP BY finance_segment
+      ORDER BY total_projected_breakage DESC NULLS LAST
+
+  - name: breakage_by_expiry_month
+    question: "What is the projected breakage by expiry month for the next 6 months?"
+    aliases:
+      - breakage by expiry month
+      - breakage totals next few months
+      - how much breakage expires each month
+      - projected breakage by month
+      - breakage by month
+      - when does breakage expire
+      - breakage timeline
+      - monthly breakage forecast
+      - expiry month breakage summary
+      - customers expiring each month
+    sql: |
+      SELECT
+           DATE_TRUNC('month', commit_expiry_date)  AS expiry_month
+          ,COUNT(DISTINCT metronome_customer_name)  AS customer_count
+          ,SUM(dollar_expected_commit_remaining)    AS total_projected_unused_commit
+          ,SUM(commit_amount_remaining)             AS total_commit_balance
+          ,AVG(days_remaining_in_commit)            AS avg_days_remaining
+      FROM analytics.prod_internal_bi.finance_consumption_revenue_explorer
+      WHERE as_of_date = most_recent_revenue_date
+        AND consumption_type ILIKE '%commit%'
+        AND commit_consumption_pacing_group ILIKE '%under%'
+      GROUP BY 1
+      ORDER BY 1 ASC
+
+  # ── MONTH-OVER-MONTH REVENUE ────────────────────────────────────────────────
+
+  - name: mom_revenue_changes
+    question: "Which customers had the biggest MoM revenue change this month vs last month?"
+    aliases:
+      - biggest month over month revenue changes
+      - biggest mom revenue change
+      - mom revenue change by customer
+      - month over month revenue changes
+      - revenue change this month vs last month
+      - which customers grew or declined most this month
+    sql: |
+      SELECT
+           metronome_customer_name
+          ,finance_segment
+          ,SUM(CASE WHEN as_of_date >= DATE_TRUNC('month', CURRENT_DATE)
+                         AND as_of_date <= CURRENT_DATE
+                    THEN snapshot_date_customer_revenue_final ELSE 0 END)  AS current_period_revenue
+          ,SUM(CASE WHEN as_of_date >= DATE_TRUNC('month', DATEADD('month', -1, CURRENT_DATE))
+                         AND as_of_date <= DATEADD('month', -1, CURRENT_DATE)
+                    THEN snapshot_date_customer_revenue_final ELSE 0 END)  AS prior_period_revenue
+          ,SUM(CASE WHEN as_of_date >= DATE_TRUNC('month', CURRENT_DATE)
+                         AND as_of_date <= CURRENT_DATE
+                    THEN snapshot_date_customer_revenue_final ELSE 0 END)
+           - SUM(CASE WHEN as_of_date >= DATE_TRUNC('month', DATEADD('month', -1, CURRENT_DATE))
+                           AND as_of_date <= DATEADD('month', -1, CURRENT_DATE)
+                      THEN snapshot_date_customer_revenue_final ELSE 0 END) AS revenue_change
+          ,ROUND(
+               (SUM(CASE WHEN as_of_date >= DATE_TRUNC('month', CURRENT_DATE)
+                              AND as_of_date <= CURRENT_DATE
+                         THEN snapshot_date_customer_revenue_final ELSE 0 END)
+               - SUM(CASE WHEN as_of_date >= DATE_TRUNC('month', DATEADD('month', -1, CURRENT_DATE))
+                               AND as_of_date <= DATEADD('month', -1, CURRENT_DATE)
+                          THEN snapshot_date_customer_revenue_final ELSE 0 END))
+               / NULLIF(SUM(CASE WHEN as_of_date >= DATE_TRUNC('month', DATEADD('month', -1, CURRENT_DATE))
+                                      AND as_of_date <= DATEADD('month', -1, CURRENT_DATE)
+                                 THEN snapshot_date_customer_revenue_final ELSE 0 END), 0)
+               * 100
+           , 1) AS pct_change
+      FROM analytics.prod_internal_bi.finance_consumption_revenue_explorer
+      WHERE (as_of_date >= DATE_TRUNC('month', CURRENT_DATE) AND as_of_date <= CURRENT_DATE)
+         OR (as_of_date >= DATE_TRUNC('month', DATEADD('month', -1, CURRENT_DATE))
+             AND as_of_date <= DATEADD('month', -1, CURRENT_DATE))
+      GROUP BY 1, 2
+      HAVING SUM(CASE WHEN as_of_date >= DATE_TRUNC('month', CURRENT_DATE)
+                           AND as_of_date <= CURRENT_DATE
+                      THEN snapshot_date_customer_revenue_final ELSE 0 END) > 0
+      ORDER BY ABS(revenue_change) DESC
+      LIMIT 20
+
+  # ── REVENUE TRENDS / TIME SERIES ───────────────────────────────────────────
+
+  - name: monthly_revenue_trend
+    question: "Show me monthly consumption revenue over time."
+    aliases:
+      - monthly revenue trend
+      - revenue by month
+      - monthly consumption revenue
+      - revenue over time by month
+      - show monthly revenue
+      - total revenue per month
+      - revenue trend over time
+    sql: |
+      WITH monthly AS (
+          SELECT
+               DATE_TRUNC('month', as_of_date)                       AS month
+              ,SUM(snapshot_date_customer_revenue_final)              AS monthly_revenue
+              ,COUNT(DISTINCT metronome_customer_name)                AS unique_customers
+              ,COUNT(*)                                               AS daily_records
+          FROM analytics.prod_internal_bi.finance_consumption_revenue_explorer
+          WHERE as_of_date <= CURRENT_DATE
+          GROUP BY 1
+      )
+      SELECT
+           month
+          ,monthly_revenue
+          ,unique_customers
+          ,daily_records
+          ,LAG(monthly_revenue) OVER (ORDER BY month)                AS prior_month_revenue
+          ,monthly_revenue - LAG(monthly_revenue) OVER (ORDER BY month) AS mom_change
+      FROM monthly
+      ORDER BY month ASC
+
+  - name: monthly_revenue_by_monitor_type
+    question: "What is the monthly revenue breakdown by monitor type?"
+    aliases:
+      - revenue by monitor type
+      - monitor type breakdown by month
+      - monthly monitor type revenue
+      - revenue breakdown by monitor
+      - insights by monitor type
+      - any insights by monitor type
+      - monitor type mix
+      - what monitor types drive revenue
+    sql: |
+      SELECT
+           DATE_TRUNC('month', as_of_date)                    AS month
+          ,SUM(table_monitor_daily_revenue)                   AS table_monitor
+          ,SUM(metric_monitor_daily_revenue)                  AS metric_monitor
+          ,SUM(custom_sql_monitor_daily_revenue)              AS custom_sql_monitor
+          ,SUM(freshness_monitor_daily_revenue)               AS freshness_monitor
+          ,SUM(volume_monitor_daily_revenue)                  AS volume_monitor
+          ,SUM(validation_monitor_daily_revenue)              AS validation_monitor
+          ,SUM(performance_monitor_daily_revenue)             AS performance_monitor
+          ,SUM(dimension_monitor_daily_revenue)               AS dimension_monitor
+          ,SUM(comparison_monitor_daily_revenue)              AS comparison_monitor
+          ,SUM(json_schema_monitor_daily_revenue)             AS json_schema_monitor
+          ,SUM(snapshot_date_customer_revenue_final)          AS total_revenue
+      FROM analytics.prod_internal_bi.finance_consumption_revenue_explorer
+      WHERE as_of_date <= CURRENT_DATE
+      GROUP BY 1
+      ORDER BY 1 ASC
+
+  - name: current_revenue_snapshot
+    question: "What is the total consumption revenue as of the most recent date?"
+    aliases:
+      - total revenue today
+      - current total revenue
+      - revenue snapshot
+      - most recent revenue
+      - what is our revenue right now
+      - total revenue latest
+      - revenue as of today
+    sql: |
+      SELECT
+           SUM(snapshot_date_customer_revenue_final)    AS total_daily_revenue
+          ,MAX(most_recent_revenue_date)                AS as_of_date
+          ,COUNT(DISTINCT metronome_customer_name)      AS unique_customers
+      FROM analytics.prod_internal_bi.finance_consumption_revenue_explorer
+      WHERE as_of_date = most_recent_revenue_date
+        AND most_recent_revenue_date = (
+            SELECT MAX(most_recent_revenue_date)
+            FROM analytics.prod_internal_bi.finance_consumption_revenue_explorer
+        )
+
+  - name: revenue_all_customers_recent
+    question: "Show me revenue for all customers as of the most recent date."
+    aliases:
+      - all customers revenue today
+      - customer revenue list latest
+      - revenue per customer most recent
+      - customer revenue snapshot
+      - list all customers with revenue
+    sql: |
+      SELECT
+           metronome_customer_name
+          ,finance_segment
+          ,snapshot_date_customer_revenue_final AS daily_revenue
+          ,commit_amount_remaining
+          ,pct_commit_amount_remaining
+          ,most_recent_revenue_date
+      FROM analytics.prod_internal_bi.finance_consumption_revenue_explorer
+      WHERE as_of_date = most_recent_revenue_date
+      ORDER BY daily_revenue DESC
+
+  # ── QUARTER-OVER-QUARTER ───────────────────────────────────────────────────
+
+  - name: q3_q4_2025_revenue_comparison
+    question: "How did revenue performance change from Q3 to Q4 2025?"
+    aliases:
+      - q3 vs q4 2025 revenue
+      - q3 to q4 revenue change 2025
+      - quarterly revenue comparison 2025
+      - revenue q3 q4
+    sql: |
+      WITH quarterly AS (
+          SELECT
+               metronome_customer_name
+              ,finance_segment
+              ,SUM(CASE WHEN DATE_PART('quarter', as_of_date) = 3
+                             AND DATE_PART('year', as_of_date) = 2025
+                        THEN snapshot_date_customer_revenue_final ELSE 0 END) AS q3_revenue
+              ,SUM(CASE WHEN DATE_PART('quarter', as_of_date) = 4
+                             AND DATE_PART('year', as_of_date) = 2025
+                        THEN snapshot_date_customer_revenue_final ELSE 0 END) AS q4_revenue
+          FROM analytics.prod_internal_bi.finance_consumption_revenue_explorer
+          WHERE DATE_PART('year', as_of_date) = 2025
+            AND DATE_PART('quarter', as_of_date) IN (3, 4)
+          GROUP BY 1, 2
+      ),
+      segment_summary AS (
+          SELECT
+               finance_segment
+              ,SUM(q3_revenue)                              AS q3_revenue
+              ,SUM(q4_revenue)                              AS q4_revenue
+              ,SUM(q4_revenue) - SUM(q3_revenue)            AS revenue_change
+              ,ROUND((SUM(q4_revenue) - SUM(q3_revenue))
+                     / NULLIF(SUM(q3_revenue), 0) * 100, 1) AS pct_change
+          FROM quarterly
+          WHERE q3_revenue > 0 OR q4_revenue > 0
+          GROUP BY 1
+      )
+      SELECT * FROM segment_summary
+      ORDER BY revenue_change DESC
+
+  - name: q3_q4_2025_total_growth
+    question: "What was the total revenue change and growth rate from Q3 to Q4 2025?"
+    aliases:
+      - total q3 to q4 growth 2025
+      - overall revenue change q3 q4
+    sql: |
+      WITH customer_rev AS (
+          SELECT
+               SUM(CASE WHEN DATE_PART('quarter', as_of_date) = 3
+                             AND DATE_PART('year', as_of_date) = 2025
+                        THEN snapshot_date_customer_revenue_final ELSE 0 END) AS q3_revenue
+              ,SUM(CASE WHEN DATE_PART('quarter', as_of_date) = 4
+                             AND DATE_PART('year', as_of_date) = 2025
+                        THEN snapshot_date_customer_revenue_final ELSE 0 END) AS q4_revenue
+          FROM analytics.prod_internal_bi.finance_consumption_revenue_explorer
+          WHERE DATE_PART('year', as_of_date) = 2025
+            AND DATE_PART('quarter', as_of_date) IN (3, 4)
+      )
+      SELECT
+           q3_revenue
+          ,q4_revenue
+          ,q4_revenue - q3_revenue                                AS revenue_change
+          ,ROUND((q4_revenue - q3_revenue) / NULLIF(q3_revenue, 0) * 100, 1) AS pct_change
+      FROM customer_rev
+
+  # ── WAU / ENGAGEMENT HEALTH ─────────────────────────────────────────────────
+
+  - name: customers_by_wau_health
+    question: "Which customers are at risk based on revenue per WAU?"
+    aliases:
+      - revenue per wau
+      - wau health
+      - customers at risk by wau
+      - churn risk by engagement
+      - over priced relative to usage
+      - revenue efficiency by customer
+      - wau vs revenue
+      - engagement vs revenue health
+      - customers with high rev per wau
+      - customers with low wau
+    sql: |
+      SELECT
+           metronome_customer_name
+          ,finance_segment
+          ,snapshot_date_customer_revenue_final          AS current_daily_revenue
+          ,trailing_completed_4wk_waus_average           AS trailing_4wk_waus
+          ,revenue_per_wau
+          ,revenue_per_wau_range_simple                  AS health_bucket
+      FROM analytics.prod_internal_bi.finance_consumption_revenue_explorer
+      WHERE as_of_date = most_recent_revenue_date
+        AND snapshot_date_customer_revenue_final > 0
+      ORDER BY
+        CASE revenue_per_wau_range_simple
+          WHEN 'c_churn_risk'        THEN 1
+          WHEN 'b_contraction_risk'  THEN 2
+          WHEN 'a_growth_potential'  THEN 3
+          ELSE 4
+        END,
+        revenue_per_wau DESC NULLS LAST
+
+  - name: customers_zero_wau_with_revenue
+    question: "Which customers have revenue but zero WAUs (disengaged risk)?"
+    aliases:
+      - customers with no waus
+      - zero wau customers
+      - customers with revenue but no engagement
+      - disengaged customers
+      - no active users but paying
+    sql: |
+      SELECT
+           metronome_customer_name
+          ,finance_segment
+          ,snapshot_date_customer_revenue_final     AS current_daily_revenue
+          ,trailing_completed_4wk_waus_average      AS trailing_4wk_waus
+          ,commit_consumption_pacing_group
+          ,commit_expiry_date
+      FROM analytics.prod_internal_bi.finance_consumption_revenue_explorer
+      WHERE as_of_date = most_recent_revenue_date
+        AND snapshot_date_customer_revenue_final > 0
+        AND (trailing_completed_4wk_waus_average = 0 OR trailing_completed_4wk_waus_average IS NULL)
+      ORDER BY current_daily_revenue DESC
+
+  # ── DEPLOYMENT / EXPANSION WHITESPACE ───────────────────────────────────────
+
+  - name: not_deployed_customers
+    question: "Which customers are signed but not yet deployed?"
+    aliases:
+      - customers not deployed
+      - not deployed
+      - signed but not live
+      - customers in deployment
+      - not yet consuming
+      - deployment whitespace
+      - onboarding pipeline
+    sql: |
+      SELECT
+           metronome_customer_name
+          ,finance_segment
+          ,flag                                     AS deployment_status
+          ,opportunity_close_date
+          ,DATEDIFF('day', opportunity_close_date, CURRENT_DATE) AS days_since_close
+      FROM analytics.prod_internal_bi.finance_consumption_revenue_explorer
+      WHERE as_of_date = most_recent_revenue_date
+        AND flag IN ('B) Not Deployed', 'C) Deployed Not Consuming')
+      ORDER BY days_since_close DESC NULLS LAST
+
+  - name: expansion_whitespace_by_customer
+    question: "Which customers have the most expansion whitespace (incremental revenue needed to hit full burn)?"
+    aliases:
+      - expansion whitespace
+      - incremental revenue whitespace
+      - revenue gap to full burn
+      - customers with most whitespace
+      - customers that could spend more
+      - upsell whitespace
+      - how much more could customers spend
+    sql: |
+      SELECT
+           metronome_customer_name
+          ,finance_segment
+          ,commit_consumption_pacing_group
+          ,snapshot_date_customer_revenue_final             AS current_daily_revenue
+          ,dynamic_daily_burn_target                        AS needed_daily_revenue
+          ,dynamic_incremental_revenue_to_full_burn         AS daily_revenue_gap
+          ,commit_expiry_date
+          ,days_remaining_in_commit
+          ,dollar_expected_commit_remaining                 AS projected_unused_commit_at_expiry
+      FROM analytics.prod_internal_bi.finance_consumption_revenue_explorer
+      WHERE as_of_date = most_recent_revenue_date
+        AND consumption_type ILIKE '%commit%'
+        AND commit_consumption_pacing_group ILIKE '%under%'
+        AND dynamic_incremental_revenue_to_full_burn > 0
+      ORDER BY dollar_expected_commit_remaining DESC NULLS LAST
+
+  # ── ACTUAL vs FORECAST BREAKAGE ─────────────────────────────────────────────
+
+  - name: actual_breakage_revenue_by_period
+    question: "How much breakage revenue has actually been recognized?"
+    aliases:
+      - actual breakage revenue
+      - realized breakage
+      - breakage actuals
+      - how much breakage have we recognized
+      - forgiveness revenue actuals
+      - historical breakage
+      - breakage revenue by month
+    sql: |
+      SELECT
+           DATE_TRUNC('month', as_of_date)                  AS month
+          ,SUM(recognized_breakage_revenue_actuals)         AS actual_breakage_revenue
+          ,COUNT(DISTINCT CASE WHEN recognized_breakage_revenue_actuals > 0
+                               THEN metronome_customer_name END) AS customers_with_breakage
+      FROM analytics.prod_internal_bi.finance_consumption_revenue_explorer
+      WHERE recognized_breakage_revenue_actuals > 0
+      GROUP BY 1
+      ORDER BY 1 ASC
+
+  - name: forecast_vs_actual_breakage
+    question: "Compare forecasted breakage (estimate at expiry) vs actual recognized breakage."
+    aliases:
+      - forecast vs actual breakage
+      - breakage forecast vs actuals
+      - projected vs realized breakage
+      - compare breakage estimate to actual
+    sql: |
+      SELECT
+           metronome_customer_name
+          ,finance_segment
+          ,SUM(recognized_breakage_revenue_actuals)         AS actual_breakage_recognized
+          ,MAX(dollar_expected_commit_remaining)            AS projected_unused_commit_at_expiry
+          ,commit_expiry_date
+      FROM analytics.prod_internal_bi.finance_consumption_revenue_explorer
+      WHERE as_of_date = most_recent_revenue_date
+        AND (recognized_breakage_revenue_actuals > 0 OR dollar_expected_commit_remaining > 0)
+      GROUP BY 1, 2, 5
+      ORDER BY projected_unused_commit_at_expiry DESC NULLS LAST
+
+  # ── ROLLOVER CUSTOMERS ───────────────────────────────────────────────────────
+
+  - name: customers_with_rollover
+    question: "Which customers have commit rollover provisions?"
+    aliases:
+      - customers with rollover
+      - rollover customers
+      - commit rollover
+      - customers whose credits roll over
+      - rollover provisions
+    sql: |
+      SELECT
+           metronome_customer_name
+          ,finance_segment
+          ,commit_rollover_amount                           AS rollover_amount
+          ,commit_amount_remaining                          AS current_commit_balance
+          ,dollar_expected_commit_remaining                 AS projected_unused_commit_at_expiry
+          ,dollar_expected_commit_remaining_net_rollover    AS net_breakage_after_rollover
+          ,commit_expiry_date
+      FROM analytics.prod_internal_bi.finance_consumption_revenue_explorer
+      WHERE as_of_date = most_recent_revenue_date
+        AND commit_rollover_amount > 0
+      ORDER BY rollover_amount DESC
+
+  # ── CHURN / REVENUE HEALTH ─────────────────────────────────────────────────
+
+  - name: churn_detection
+    question: "Which customers have stopped generating revenue and may be churning?"
+    aliases:
+      - customers stopped generating revenue
+      - potential churn customers
+      - churn risk
+      - customers with no recent revenue
+      - customers gone dark
+      - inactive customers
+    sql: |
+      SELECT
+           metronome_customer_id
+          ,metronome_customer_name
+          ,finance_segment
+          ,most_recent_revenue_date
+          ,SUM(snapshot_date_customer_revenue_final) AS total_lifetime_revenue
+          ,DATEDIFF('day', most_recent_revenue_date, CURRENT_DATE) AS days_since_last_revenue
+      FROM analytics.prod_internal_bi.finance_consumption_revenue_explorer
+      WHERE as_of_date = most_recent_revenue_date
+      GROUP BY 1, 2, 3, 4
+      HAVING days_since_last_revenue > 14
+      ORDER BY days_since_last_revenue DESC
+
+  # ── TOP CUSTOMERS ──────────────────────────────────────────────────────────
+
+  - name: top_customers_by_revenue
+    question: "Who are the top customers by revenue this month?"
+    aliases:
+      - top customers by revenue
+      - highest revenue customers
+      - biggest customers by revenue
+      - top revenue customers this month
+      - largest customers
+      - top 10 customers revenue
+      - top 20 customers revenue
+    sql: |
+      SELECT
+           metronome_customer_name
+          ,finance_segment
+          ,SUM(snapshot_date_customer_revenue_final) AS total_revenue
+      FROM analytics.prod_internal_bi.finance_consumption_revenue_explorer
+      WHERE as_of_date >= DATE_TRUNC('month', CURRENT_DATE)
+        AND as_of_date <= CURRENT_DATE
+      GROUP BY 1, 2
+      ORDER BY total_revenue DESC
+      LIMIT 20
+
+  # ── NEW LOGO / GROWTH ATTRIBUTION ─────────────────────────────────────────
+
+  - name: new_logo_vs_growth_revenue
+    question: "What is the revenue split between new logos and net growth?"
+    aliases:
+      - new logo vs growth revenue
+      - new customers vs expansion revenue
+      - new logo revenue breakdown
+      - growth vs new logo
+      - net growth vs new logo
+      - new and expanding customer revenue
+    sql: |
+      SELECT
+           new_logo_or_growth
+          ,finance_segment
+          ,SUM(snapshot_date_customer_revenue_final) AS total_revenue
+          ,COUNT(DISTINCT metronome_customer_name)   AS unique_customers
+      FROM analytics.prod_internal_bi.finance_consumption_revenue_explorer
+      WHERE as_of_date >= DATE_TRUNC('month', CURRENT_DATE)
+        AND as_of_date <= CURRENT_DATE
+      GROUP BY 1, 2
+      ORDER BY total_revenue DESC
